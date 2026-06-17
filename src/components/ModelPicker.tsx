@@ -8,9 +8,10 @@ import { FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeCooldown, isFas
 import { Box, Text } from '../ink.js';
 import { useKeybindings } from '../keybindings/useKeybinding.js';
 import { useAppState, useSetAppState } from '../state/AppState.js';
-import { convertEffortValueToLevel, type EffortLevel, getDefaultEffortForModel, modelSupportsEffort, modelSupportsMaxEffort, resolvePickerEffortPersistence, toPersistableEffort } from '../utils/effort.js';
+import { convertEffortValueToLevel, type EffortLevel, getAvailableEffortLevels, getDefaultEffortForModel, modelSupportsEffort, modelSupportsMaxEffort, resolvePickerEffortPersistence, toPersistableEffort } from '../utils/effort.js';
+import { isModelAllowed } from '../utils/model/modelAllowlist.js';
 import { getDefaultMainLoopModel, type ModelSetting, modelDisplayString, parseUserSpecifiedModel } from '../utils/model/model.js';
-import { getModelOptions } from '../utils/model/modelOptions.js';
+import { getModelOptions, type ModelOption } from '../utils/model/modelOptions.js';
 import { getSettingsForSource, updateSettingsForSource } from '../utils/settings/settings.js';
 import { ConfigurableShortcutHint } from './ConfigurableShortcutHint.js';
 import { Select } from './CustomSelect/index.js';
@@ -18,6 +19,10 @@ import { Byline } from './design-system/Byline.js';
 import { KeyboardShortcutHint } from './design-system/KeyboardShortcutHint.js';
 import { Pane } from './design-system/Pane.js';
 import { effortLevelToSymbol } from './EffortIndicator.js';
+export type ModelPickerDiscoveryState = {
+  message: string;
+  tone?: 'info' | 'success' | 'warning' | 'error';
+};
 export type Props = {
   initial: string | null;
   sessionModel?: ModelSetting;
@@ -30,14 +35,30 @@ export type Props = {
   /**
    * When true, skip writing effortLevel to userSettings on selection.
    * Used by the assistant installer wizard where the model choice is
-   * project-scoped (written to the assistant's .claude/settings.json via
-   * install.ts) and should not leak to the user's global ~/.claude/settings.
+   * project-scoped (written to the assistant's .openclaude/settings.json via
+   * install.ts) and should not leak to the user's global ~/.openclaude/settings.json.
    */
   skipSettingsWrite?: boolean;
+  optionsOverride?: ModelOption[];
+  discoveryState?: ModelPickerDiscoveryState;
+  onRefresh?: () => void;
 };
 const NO_PREFERENCE = '__NO_PREFERENCE__';
+function mapDiscoveryToneToColor(tone: ModelPickerDiscoveryState['tone']): 'error' | 'warning' | 'success' | 'subtle' {
+  switch (tone) {
+    case 'error':
+      return 'error';
+    case 'warning':
+      return 'warning';
+    case 'success':
+      return 'success';
+    case 'info':
+    default:
+      return 'subtle';
+  }
+}
 export function ModelPicker(t0) {
-  const $ = _c(82);
+  const $ = _c(83);
   const {
     initial,
     sessionModel,
@@ -46,7 +67,10 @@ export function ModelPicker(t0) {
     isStandaloneCommand,
     showFastModeNotice,
     headerText,
-    skipSettingsWrite
+    skipSettingsWrite,
+    optionsOverride,
+    discoveryState,
+    onRefresh
   } = t0;
   const setAppState = useSetAppState();
   const exitState = useExitOnCtrlCDWithKeybindings();
@@ -73,10 +97,10 @@ export function ModelPicker(t0) {
   } else {
     t3 = $[3];
   }
-  const modelOptions = t3;
+  const modelOptions = optionsOverride ?? t3;
   let t4;
   bb0: {
-    if (initial !== null && !modelOptions.some(opt => opt.value === initial)) {
+    if (initial !== null && isModelAllowed(initial) && !modelOptions.some(opt => opt.value === initial)) {
       let t5;
       if ($[4] !== initial) {
         t5 = modelDisplayString(initial);
@@ -158,6 +182,10 @@ export function ModelPicker(t0) {
     t8 = $[22];
   }
   const focusedSupportsMax = t8;
+  const focusedAvailableLevels: EffortLevel[] = (() => {
+    const focusedModel = resolveOptionModel(focusedValue);
+    return focusedModel ? getAvailableEffortLevels(focusedModel) : [];
+  })();
   let t9;
   if ($[23] !== focusedValue) {
     t9 = getDefaultEffortLevelForOption(focusedValue);
@@ -167,7 +195,7 @@ export function ModelPicker(t0) {
     t9 = $[24];
   }
   const focusedDefaultEffort = t9;
-  const displayEffort = effort === "max" && !focusedSupportsMax ? "high" : effort;
+  const displayEffort = focusedAvailableLevels.includes(effort) ? effort : "high";
   let t10;
   if ($[25] !== effortValue || $[26] !== hasToggledEffort) {
     t10 = value => {
@@ -184,33 +212,30 @@ export function ModelPicker(t0) {
   }
   const handleFocus = t10;
   let t11;
-  if ($[28] !== focusedDefaultEffort || $[29] !== focusedSupportsEffort || $[30] !== focusedSupportsMax) {
+  if ($[28] !== focusedDefaultEffort || $[29] !== focusedSupportsEffort || $[30] !== focusedSupportsMax || $[31] !== focusedAvailableLevels) {
     t11 = direction => {
       if (!focusedSupportsEffort) {
         return;
       }
-      setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction, focusedSupportsMax));
+      setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction, focusedAvailableLevels));
       setHasToggledEffort(true);
     };
     $[28] = focusedDefaultEffort;
     $[29] = focusedSupportsEffort;
     $[30] = focusedSupportsMax;
-    $[31] = t11;
+    $[31] = focusedAvailableLevels;
+    $[32] = t11;
   } else {
-    t11 = $[31];
+    t11 = $[32];
   }
   const handleCycleEffort = t11;
-  let t12;
-  if ($[32] !== handleCycleEffort) {
-    t12 = {
-      "modelPicker:decreaseEffort": () => handleCycleEffort("left"),
-      "modelPicker:increaseEffort": () => handleCycleEffort("right")
-    };
-    $[32] = handleCycleEffort;
-    $[33] = t12;
-  } else {
-    t12 = $[33];
-  }
+  const t12 = {
+    "modelPicker:decreaseEffort": () => handleCycleEffort("left"),
+    "modelPicker:increaseEffort": () => handleCycleEffort("right"),
+    ...(onRefresh ? {
+      "modelPicker:refresh": () => onRefresh()
+    } : {})
+  };
   let t13;
   if ($[34] === Symbol.for("react.memo_cache_sentinel")) {
     t13 = {
@@ -222,13 +247,22 @@ export function ModelPicker(t0) {
   }
   useKeybindings(t12, t13);
   let t14;
-  if ($[35] !== effort || $[36] !== hasToggledEffort || $[37] !== onSelect || $[38] !== setAppState || $[39] !== skipSettingsWrite) {
+  if ($[35] !== effort || $[36] !== hasToggledEffort || $[37] !== onSelect || $[38] !== setAppState || $[39] !== skipSettingsWrite || $[46] !== focusedAvailableLevels || $[47] !== focusedDefaultEffort) {
     t14 = function handleSelect(value_0) {
+      const selectedModel = resolveOptionModel(value_0);
+      if (value_0 !== NO_PREFERENCE && selectedModel && !isModelAllowed(selectedModel)) {
+        onSelect(value_0 === NO_PREFERENCE ? null : value_0, undefined);
+        return;
+      }
+      // Clamp effort to a value in the focused model's available levels so
+      // emitted/persisted values are always valid for the picked model
+      // (e.g. toggled 'xhigh' then picked a model that doesn't support it).
+      const clampedEffort = focusedAvailableLevels.includes(effort) ? effort : focusedDefaultEffort;
       logEvent("tengu_model_command_menu_effort", {
-        effort: effort as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+        effort: clampedEffort as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
       });
       if (!skipSettingsWrite) {
-        const effortLevel = resolvePickerEffortPersistence(effort, getDefaultEffortLevelForOption(value_0), getSettingsForSource("userSettings")?.effortLevel, hasToggledEffort);
+        const effortLevel = resolvePickerEffortPersistence(clampedEffort, getDefaultEffortLevelForOption(value_0), getSettingsForSource("userSettings")?.effortLevel, hasToggledEffort);
         const persistable = toPersistableEffort(effortLevel);
         if (persistable !== undefined) {
           updateSettingsForSource("userSettings", {
@@ -240,8 +274,7 @@ export function ModelPicker(t0) {
           effortValue: effortLevel
         }));
       }
-      const selectedModel = resolveOptionModel(value_0);
-      const selectedEffort = hasToggledEffort && selectedModel && modelSupportsEffort(selectedModel) ? effort : undefined;
+      const selectedEffort = hasToggledEffort && selectedModel && modelSupportsEffort(selectedModel) ? clampedEffort : undefined;
       if (value_0 === NO_PREFERENCE) {
         onSelect(null, selectedEffort);
         return;
@@ -253,6 +286,8 @@ export function ModelPicker(t0) {
     $[37] = onSelect;
     $[38] = setAppState;
     $[39] = skipSettingsWrite;
+    $[46] = focusedAvailableLevels;
+    $[47] = focusedDefaultEffort;
     $[40] = t14;
   } else {
     t14 = $[40];
@@ -265,7 +300,7 @@ export function ModelPicker(t0) {
   } else {
     t15 = $[41];
   }
-  const t16 = headerText ?? "Switch between Claude models. Applies to this session and future Claude Code sessions. For other/previous model names, specify with --model.";
+  const t16 = headerText ?? "Switch between Claude models. Applies to this session and future OpenClaude sessions. For other/previous model names, specify with --model.";
   let t17;
   if ($[42] !== t16) {
     t17 = <Text dimColor={true}>{t16}</Text>;
@@ -282,15 +317,9 @@ export function ModelPicker(t0) {
   } else {
     t18 = $[45];
   }
-  let t19;
-  if ($[46] !== t17 || $[47] !== t18) {
-    t19 = <Box marginBottom={1} flexDirection="column">{t15}{t17}{t18}</Box>;
-    $[46] = t17;
-    $[47] = t18;
-    $[48] = t19;
-  } else {
-    t19 = $[48];
-  }
+  const refreshHint = onRefresh ? <ConfigurableShortcutHint action="modelPicker:refresh" context="ModelPicker" fallback="r" description="refresh models" /> : null;
+  const discoveryLine = discoveryState ? <Text color={mapDiscoveryToneToColor(discoveryState.tone)}>{discoveryState.message}{refreshHint ? <Text color="subtle"> {" "}· {refreshHint}</Text> : null}</Text> : refreshHint ? <Text dimColor={true}>{refreshHint}</Text> : null;
+  const t19 = <Box marginBottom={1} flexDirection="column">{t15}{t17}{t18}{discoveryLine}</Box>;
   const t20 = onCancel ?? _temp4;
   let t21;
   if ($[49] !== handleFocus || $[50] !== handleSelect || $[51] !== initialFocusValue || $[52] !== initialValue || $[53] !== selectOptions || $[54] !== t20 || $[55] !== visibleCount) {
@@ -354,13 +383,14 @@ export function ModelPicker(t0) {
     t26 = $[73];
   }
   let t27;
-  if ($[74] !== exitState || $[75] !== isStandaloneCommand) {
-    t27 = isStandaloneCommand && <Text dimColor={true} italic={true}>{exitState.pending ? <>Press {exitState.keyName} again to exit</> : <Byline><KeyboardShortcutHint shortcut="Enter" action="confirm" /><ConfigurableShortcutHint action="select:cancel" context="Select" fallback="Esc" description="exit" /></Byline>}</Text>;
+  if ($[74] !== exitState || $[75] !== isStandaloneCommand || $[76] !== refreshHint) {
+    t27 = isStandaloneCommand && <Text dimColor={true} italic={true}>{exitState.pending ? <>Press {exitState.keyName} again to exit</> : <Byline><KeyboardShortcutHint shortcut="Enter" action="confirm" />{refreshHint}<ConfigurableShortcutHint action="select:cancel" context="Select" fallback="Esc" description="exit" /></Byline>}</Text>;
     $[74] = exitState;
     $[75] = isStandaloneCommand;
-    $[76] = t27;
+    $[76] = refreshHint;
+    $[82] = t27;
   } else {
-    t27 = $[76];
+    t27 = $[82];
   }
   let t28;
   if ($[77] !== t26 || $[78] !== t27) {
@@ -428,10 +458,9 @@ function EffortLevelIndicator(t0) {
   }
   return t4;
 }
-function cycleEffortLevel(current: EffortLevel, direction: 'left' | 'right', includeMax: boolean): EffortLevel {
-  const levels: EffortLevel[] = includeMax ? ['low', 'medium', 'high', 'max'] : ['low', 'medium', 'high'];
+function cycleEffortLevel(current: EffortLevel, direction: 'left' | 'right', levels: EffortLevel[]): EffortLevel {
   // If the current level isn't in the cycle (e.g. 'max' after switching to a
-  // non-Opus model), clamp to 'high'.
+  // non-max model), clamp to 'high'.
   const idx = levels.indexOf(current);
   const currentIndex = idx !== -1 ? idx : levels.indexOf('high');
   if (direction === 'right') {

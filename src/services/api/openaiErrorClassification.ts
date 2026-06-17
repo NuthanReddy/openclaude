@@ -7,6 +7,7 @@ export type OpenAICompatibilityFailureCategory =
   | 'rate_limited'
   | 'model_not_found'
   | 'endpoint_not_found'
+  | 'vision_not_supported'
   | 'context_overflow'
   | 'tool_call_incompatible'
   | 'malformed_provider_response'
@@ -21,6 +22,7 @@ export type OpenAICompatibilityFailure = {
   hint?: string
   code?: string
   status?: number
+  requestUrl?: string
 }
 
 const OPENAI_CATEGORY_MARKER_PREFIX = '[openai_category='
@@ -37,11 +39,22 @@ const OPENAI_COMPATIBILITY_FAILURE_CATEGORIES: ReadonlySet<OpenAICompatibilityFa
     'rate_limited',
     'model_not_found',
     'endpoint_not_found',
+    'vision_not_supported',
     'context_overflow',
     'tool_call_incompatible',
     'malformed_provider_response',
     'provider_unavailable',
     'unknown',
+  ])
+
+const RETRYABLE_OPENAI_COMPATIBILITY_FAILURE_CATEGORIES: ReadonlySet<OpenAICompatibilityFailureCategory> =
+  new Set<OpenAICompatibilityFailureCategory>([
+    'connection_refused',
+    'localhost_resolution_failed',
+    'request_timeout',
+    'network_error',
+    'rate_limited',
+    'provider_unavailable',
   ])
 
 function isOpenAICompatibilityFailureCategory(
@@ -50,6 +63,12 @@ function isOpenAICompatibilityFailureCategory(
   return OPENAI_COMPATIBILITY_FAILURE_CATEGORIES.has(
     value as OpenAICompatibilityFailureCategory,
   )
+}
+
+export function isRetryableOpenAICompatibilityFailureCategory(
+  category: OpenAICompatibilityFailureCategory,
+): boolean {
+  return RETRYABLE_OPENAI_COMPATIBILITY_FAILURE_CATEGORIES.has(category)
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -96,6 +115,11 @@ function isLocalhostLikeHostname(hostname: string | null): boolean {
   return /^127\./.test(hostname)
 }
 
+export function isLocalhostLikeHost(host: string | null | undefined): boolean {
+  if (!host) return false
+  return isLocalhostLikeHostname(host.toLowerCase())
+}
+
 function isContextOverflowMessage(body: string): boolean {
   const lower = body.toLowerCase()
   return (
@@ -134,6 +158,34 @@ function isMalformedProviderResponse(body: string): boolean {
   )
 }
 
+/**
+ * Detect provider messages that complain about a missing/required `text`
+ * field on an otherwise image-bearing payload. Xiaomi Mimo surfaces this as
+ * `{"error":{"code":"400","message":"Param Incorrect","param":"`text` is not set"}}`
+ * (with backticks around `text`) when a `role: "tool"` message carries
+ * images but no text part. Other OpenAI-compatible providers may phrase
+ * it differently — match liberally.
+ *
+ * Only meaningful when `hasImages` is true (we never want this branch to fire
+ * for text-only requests, which legitimately lack a text field on vision-only
+ * payloads).
+ */
+function isMissingTextPartMessage(body: string): boolean {
+  // Strip backticks so `\`text\` is not set` matches the same patterns as
+  // `text is not set` — the Xiaomi Mimo 400 body wraps `text` in backticks
+  // inside the `param` field, which trips naive substring matching.
+  const lower = body.toLowerCase().replace(/`/g, '')
+  return (
+    lower.includes('text is not set') ||
+    lower.includes('text is required') ||
+    lower.includes('text parameter is required') ||
+    lower.includes('text parameter is missing') ||
+    lower.includes('missing text') ||
+    lower.includes('"param":"text"') ||
+    lower.includes('"param": "text"')
+  )
+}
+
 function isModelNotFoundMessage(body: string): boolean {
   const lower = body.toLowerCase()
   return (
@@ -149,14 +201,18 @@ function isModelNotFoundMessage(body: string): boolean {
 
 export function formatOpenAICategoryMarker(
   category: OpenAICompatibilityFailureCategory,
+  host?: string,
 ): string {
+  if (host && /^[A-Za-z0-9.\-:]+$/.test(host)) {
+    return `${OPENAI_CATEGORY_MARKER_PREFIX}${category},host=${host}]`
+  }
   return `${OPENAI_CATEGORY_MARKER_PREFIX}${category}]`
 }
 
 export function extractOpenAICategoryMarker(
   message: string,
 ): OpenAICompatibilityFailureCategory | undefined {
-  const match = message.match(/\[openai_category=([a-z_]+)]/)
+  const match = message.match(/\[openai_category=([a-z_]+)(?:,host=[^\]]+)?]/)
   const category = match?.[1]
 
   if (!category || !isOpenAICompatibilityFailureCategory(category)) {
@@ -166,11 +222,17 @@ export function extractOpenAICategoryMarker(
   return category
 }
 
+export function extractOpenAICategoryHost(message: string): string | undefined {
+  const match = message.match(/\[openai_category=[a-z_]+,host=([A-Za-z0-9.\-:]+)]/)
+  return match?.[1]
+}
+
 export function buildOpenAICompatibilityErrorMessage(
   baseMessage: string,
-  failure: Pick<OpenAICompatibilityFailure, 'category' | 'hint'>,
+  failure: Pick<OpenAICompatibilityFailure, 'category' | 'hint' | 'requestUrl'>,
 ): string {
-  const marker = formatOpenAICategoryMarker(failure.category)
+  const host = failure.requestUrl ? getHostname(failure.requestUrl) ?? undefined : undefined
+  const marker = formatOpenAICategoryMarker(failure.category, host)
   const hint = failure.hint ? ` Hint: ${failure.hint}` : ''
   return `${baseMessage} ${marker}${hint}`
 }
@@ -247,17 +309,32 @@ export function classifyOpenAINetworkFailure(
 export function classifyOpenAIHttpFailure(options: {
   status: number
   body: string
+  url?: string
+  hasImages?: boolean
 }): OpenAICompatibilityFailure {
   const body = options.body ?? ''
+  const hostname = options.url ? getHostname(options.url) : null
+  const isLocalHost = isLocalhostLikeHostname(hostname)
 
   if (options.status === 401 || options.status === 403) {
+    // OAuth-issued tokens (GitHub Models via /onboard-github, Codex) expire
+    // and surface as 401 with a "token expired" body. The generic API-key
+    // hint sends users hunting for a key they never set — point them at the
+    // re-auth command instead. Issue #1042.
+    const lowerBody = body.toLowerCase()
+    const isExpiredOAuthToken =
+      lowerBody.includes('token expired') ||
+      lowerBody.includes('token has expired') ||
+      lowerBody.includes('token revoked')
     return {
       source: 'http',
       category: 'auth_invalid',
       retryable: false,
       status: options.status,
       message: body,
-      hint: 'Authentication failed. Verify API key, token source, and endpoint-specific auth headers.',
+      hint: isExpiredOAuthToken
+        ? 'OAuth token expired. Re-authenticate with /onboard-github (GitHub Models) or /login (Codex / Claude) and try again.'
+        : 'Authentication failed. Verify API key, token source, and endpoint-specific auth headers.',
     }
   }
 
@@ -283,14 +360,50 @@ export function classifyOpenAIHttpFailure(options: {
     }
   }
 
+  if (options.status === 404 && options.hasImages) {
+    return {
+      source: 'http',
+      category: 'vision_not_supported',
+      retryable: false,
+      status: options.status,
+      message: body,
+      requestUrl: options.url,
+      hint: 'The provider returned 404 for a request containing images. The model may not support vision/image inputs.',
+    }
+  }
+
+  // Xiaomi Mimo and similar OpenAI-compatible providers reject image-bearing
+  // `role: "tool"` messages with a 400 carrying `text is not set` instead of
+  // a 404. Classify the same way as the 404 + hasImages branch so the user
+  // gets actionable guidance rather than the raw API error (issue #1421).
+  if (
+    options.status === 400 &&
+    options.hasImages &&
+    isMissingTextPartMessage(body)
+  ) {
+    return {
+      source: 'http',
+      category: 'vision_not_supported',
+      retryable: false,
+      status: options.status,
+      message: body,
+      requestUrl: options.url,
+      hint: 'The provider rejected a request containing an image (likely a tool result) because it did not include a text part. The model may not support image/vision inputs.',
+    }
+  }
+
   if (options.status === 404) {
+    const isRemote = hostname !== null && !isLocalHost
     return {
       source: 'http',
       category: 'endpoint_not_found',
       retryable: false,
       status: options.status,
       message: body,
-      hint: 'Endpoint was not found. Confirm OPENAI_BASE_URL includes /v1 for OpenAI-compatible local providers.',
+      requestUrl: options.url,
+      hint: isRemote
+        ? `Endpoint at ${hostname} returned 404. Verify OPENAI_BASE_URL is correct and the requested model is supported by this provider.`
+        : 'Endpoint was not found. Confirm OPENAI_BASE_URL includes /v1 for OpenAI-compatible local providers.',
     }
   }
 

@@ -25,6 +25,7 @@ import {
   NO_RESPONSE_REQUESTED,
 } from 'src/utils/messages.js'
 import {
+  getDefaultMainLoopModel,
   getDefaultMainLoopModelSetting,
   isNonCustomOpusModel,
 } from 'src/utils/model/model.js'
@@ -51,7 +52,9 @@ import {
 import { shouldProcessRateLimits } from '../rateLimitMocking.js' // Used for /mock-limits command
 import { extractConnectionErrorDetails, formatAPIError } from './errorUtils.js'
 import {
+  extractOpenAICategoryHost,
   extractOpenAICategoryMarker,
+  isLocalhostLikeHost,
   type OpenAICompatibilityFailureCategory,
 } from './openaiErrorClassification.js'
 
@@ -68,26 +71,37 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
   category: OpenAICompatibilityFailureCategory
   model: string
   rawMessage: string
+  host?: string
 }): AssistantMessage {
   const switchCmd = getIsNonInteractiveSession() ? '--model' : '/model'
   const compactHint = getIsNonInteractiveSession()
     ? 'Reduce prompt size or start a new session.'
     : 'Run /compact or start a new session with /new.'
+  const isLocalhost = options.host === undefined || isLocalhostLikeHost(options.host)
 
   switch (options.category) {
     case 'localhost_resolution_failed':
     case 'connection_refused':
       return createAssistantAPIErrorMessage({
-        content:
-          'Could not connect to the local OpenAI-compatible provider. Ensure the local server is running, then use OPENAI_BASE_URL=http://127.0.0.1:11434/v1 for Ollama.',
+        content: isLocalhost
+          ? 'Could not connect to the local OpenAI-compatible provider. Ensure the local server is running, then use OPENAI_BASE_URL=http://127.0.0.1:11434/v1 for Ollama.'
+          : `Could not connect to the provider at ${options.host}. Verify OPENAI_BASE_URL is correct and that the host is reachable.`,
         error: 'unknown',
       })
 
     case 'endpoint_not_found':
       return createAssistantAPIErrorMessage({
-        content:
-          'Provider endpoint was not found. Confirm OPENAI_BASE_URL targets an OpenAI-compatible /v1 endpoint (for Ollama: http://127.0.0.1:11434/v1).',
+        content: isLocalhost
+          ? 'Provider endpoint was not found. Confirm OPENAI_BASE_URL targets an OpenAI-compatible /v1 endpoint (for Ollama: http://127.0.0.1:11434/v1).'
+          : `Provider endpoint at ${options.host} returned 404. Verify OPENAI_BASE_URL is correct and that the selected model (${options.model}) is supported by this provider.`,
         error: 'invalid_request',
+      })
+
+    case 'vision_not_supported':
+      return createAssistantAPIErrorMessage({
+        content: getVisionNotSupportedErrorMessage(),
+        error: 'invalid_request',
+        errorDetails: stripOpenAICompatibilityMetadata(options.rawMessage),
       })
 
     case 'model_not_found':
@@ -218,6 +232,91 @@ export function getPromptTooLongTokenGap(
   return gap > 0 ? gap : undefined
 }
 
+const PROVIDER_MAX_TOKENS_CAP_NUMBER =
+  '([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)'
+
+const PROVIDER_MAX_TOKENS_CAP_PATTERNS = [
+  new RegExp(
+    `\\bmax_(?:completion_)?tokens\\b.{0,240}?\\bmaximum\\s+(?:output|completion)\\s+tokens?\\b[^0-9]{0,80}${PROVIDER_MAX_TOKENS_CAP_NUMBER}(?![0-9,]|\\.[0-9])`,
+    'is',
+  ),
+]
+
+function parseSafePositiveInteger(raw: string): number | undefined {
+  if (!/^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)$/.test(raw)) {
+    return undefined
+  }
+
+  const normalized = raw.replace(/,/g, '')
+  if (!/^[0-9]+$/.test(normalized)) {
+    return undefined
+  }
+
+  const value = Number.parseInt(normalized, 10)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return undefined
+  }
+
+  return value
+}
+
+/**
+ * Parses provider-returned output token caps from runtime request errors.
+ * These are lower than static model metadata because gateways may account for
+ * prompt size or route-specific output limits at request time.
+ *
+ * OpenRouter-style 402 affordability errors are intentionally excluded here.
+ * Those are adjusted inside withRetry so that path has one recovery owner.
+ */
+export function parseProviderMaxTokensCap(
+  rawMessage: string,
+): number | undefined {
+  for (const pattern of PROVIDER_MAX_TOKENS_CAP_PATTERNS) {
+    const match = rawMessage.match(pattern)
+    const rawCap = match?.slice(1).find(Boolean)
+    if (!rawCap) {
+      continue
+    }
+
+    const cap = parseSafePositiveInteger(rawCap)
+    if (cap !== undefined) {
+      return cap
+    }
+  }
+
+  return undefined
+}
+
+export function getProviderMaxTokensCapFromMessage(
+  msg: AssistantMessage | undefined,
+): number | undefined {
+  if (
+    msg?.type !== 'assistant' ||
+    msg.apiError !== 'max_tokens_too_high'
+  ) {
+    return undefined
+  }
+
+  if (msg.errorDetails) {
+    return parseProviderMaxTokensCap(msg.errorDetails)
+  }
+
+  const content = msg.message?.content
+  if (!Array.isArray(content)) {
+    return undefined
+  }
+
+  const text = content
+    .filter(
+      (block): block is Extract<typeof block, { type: 'text' }> =>
+        block?.type === 'text' && typeof block.text === 'string',
+    )
+    .map(block => block.text)
+    .join('\n')
+
+  return parseProviderMaxTokensCap(text)
+}
+
 /**
  * Is this raw API error text a media-size rejection that stripImagesFromMessages
  * can fix? Reactive compact's summarize retry uses this to decide whether to
@@ -301,8 +400,33 @@ export function getRequestTooLargeErrorMessage(): string {
     ? `Request too large (${limits}). Try with a smaller file.`
     : `Request too large (${limits}). Double press esc to go back and try with a smaller file.`
 }
+
+const VISION_NOT_SUPPORTED_MESSAGE_PREFIX =
+  'The active model does not support image/vision inputs. The provider rejected the request because it contained an image. Remove the image, or'
+
+export function getVisionNotSupportedErrorMessages(): string[] {
+  return [
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} switch to a vision-capable model with --model.`,
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} run /model to switch to a vision-capable model.`,
+  ]
+}
+
+/**
+ * Canonical message for the `vision_not_supported` OpenAI compatibility
+ * failure (issue #1421). Returned as a stable string so that
+ * `normalizeMessagesForAPI`'s `errorToBlockTypes` map can self-heal existing
+ * transcripts by stripping `image` blocks from the preceding user message
+ * on resume.
+ */
+export function getVisionNotSupportedErrorMessage(): string {
+  const [nonInteractiveMessage, interactiveMessage] =
+    getVisionNotSupportedErrorMessages()
+  return getIsNonInteractiveSession()
+    ? nonInteractiveMessage!
+    : interactiveMessage!
+}
 export const OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE =
-  'Your account does not have access to Claude Code. Please run /login.'
+  'Your account does not have access to OpenClaude. Please run /login.'
 
 export function getTokenRevokedErrorMessage(): string {
   return getIsNonInteractiveSession()
@@ -558,6 +682,18 @@ export function getAssistantMessageFromError(
     })
   }
 
+  if (error instanceof APIError) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
+  }
+
   // OpenAI-compatible transport and HTTP failures include structured category
   // markers from openaiShim.ts for actionable end-user remediation.
   if (error instanceof APIError) {
@@ -567,6 +703,7 @@ export function getAssistantMessageFromError(
         category: openaiCategory,
         model,
         rawMessage: error.message,
+        host: extractOpenAICategoryHost(error.message),
       })
     }
   }
@@ -679,6 +816,18 @@ export function getAssistantMessageFromError(
       content: `${API_ERROR_MESSAGE_PREFIX}: Request rejected (429) · ${detail || 'this may be a temporary capacity issue'} — ${retryHint}`,
       error: 'rate_limit',
     })
+  }
+
+  if (!(error instanceof APIError) && error instanceof Error) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
   }
 
   // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
@@ -1002,8 +1151,8 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       error: 'authentication_failed',
       content: getIsNonInteractiveSession()
-        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`
-        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`
+        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`,
     })
   }
 
@@ -1346,12 +1495,13 @@ export function getErrorMessageIfRefusal(
       : "your provider's acceptable use policy"
 
   const baseMessage = getIsNonInteractiveSession()
-    ? `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Try rephrasing the request or attempting a different approach.`
-    : `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Please double press esc to edit your last message or start a new session for Claude Code to assist with a different task.`
+    ? `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Try rephrasing the request or attempting a different approach.`
+    : `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Please double press esc to edit your last message or start a new session for OpenClaude to assist with a different task.`
 
+  const defaultModel = getDefaultMainLoopModel()
   const modelSuggestion =
-    model !== 'claude-sonnet-4-20250514'
-      ? ' If you are seeing this refusal repeatedly, try running /model claude-sonnet-4-20250514 to switch models.'
+    model !== defaultModel
+      ? ` If you are seeing this refusal repeatedly, try running /model ${defaultModel} to switch models.`
       : ''
 
   return createAssistantAPIErrorMessage({
